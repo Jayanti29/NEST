@@ -72,6 +72,7 @@ async function ringGet(path: string) {
   return response.json();
 }
 const ringEndpoint = (req: express.Request, res: express.Response, path: string) => {
+  res.set('Cache-Control','no-store, private');
   ringGet(path).then(data => ok(res, { source: 'Ring API', data })).catch((error: any) => {
     const status = Number(error.status) || 502;
     fail(res, status, status === 401 ? 'RING_TOKEN_EXPIRED' : status === 403 ? 'RING_FORBIDDEN' : status === 429 ? 'RING_RATE_LIMITED' : status === 503 ? 'RING_NOT_CONFIGURED' : 'RING_UNAVAILABLE', error.message || 'Ring is unavailable.');
