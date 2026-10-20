@@ -25,6 +25,8 @@ Open the Vite URL printed by the client (usually `http://localhost:5173`). The E
 
 The project follows the attached NEST Developer Build Specification and uses the Alexa+ simulated-experience path described in the Build, Ship, Shape hackathon resources. The simulator remains available. An optional Ring Playground makes read-only, server-to-server calls to the documented Ring API when `RING_ACCESS_TOKEN` is configured. The bearer token remains in the ignored local `.env` file and is never sent to the browser or written to SQLite. Ring data is fetched only when a user invokes an endpoint; it is not stored in the NEST demo database.
 
+Ring app credentials belong in the ignored local `.env`: `RING_CLIENT_ID`, `RING_CLIENT_SECRET`, and `RING_WEBHOOK_HMAC_KEY`. The client ID and secret identify the app during an OAuth token exchange; they do not grant API access by themselves. The Playground currently uses a temporary `RING_ACCESS_TOKEN` for read-only API requests. A refresh token, if issued for your app, can be stored as `RING_REFRESH_TOKEN`; this prototype does not exchange or persist tokens automatically. Keep `.env` owner-only (`chmod 600 .env`) and never share or commit it. Do not paste tokens or secrets into issues, source files, or chat.
+
 The AWS Builder mini-challenge is optional. No AWS credentials were supplied, and this build does not call Bedrock. Do not describe AWS as an integration in a submission unless Bedrock is configured and demonstrated.
 
 ## Data, safety and privacy
@@ -56,7 +58,7 @@ All JSON responses use `{ "ok": true, "data": ... }` or `{ "ok": false, "error":
 | GET | `/api/people/:id/care/timeline` | Merged caregiver timeline |
 | POST | `/api/people/:id/assistant` | Offline tool-based assistant |
 
-The Ring Playground also proxies the documented read endpoints for users, device list/detail, status, capabilities, location, configurations and event history. These requests go from Express to `https://api.amazonvision.com`; the browser never receives `RING_ACCESS_TOKEN`. The temporary token supplied for this task was rejected with HTTP 401. Generate a fresh token in the Ring Developer Portal, update the ignored `.env`, and restart the server before invoking Ring endpoints.
+The Ring Playground also proxies the documented read endpoints for users, device list/detail, status, capabilities, location, configurations and event history. These requests go from Express to `https://api.amazonvision.com`; the browser never receives `RING_ACCESS_TOKEN`. The temporary token previously supplied for this task was rejected with HTTP 401. Generate a fresh temporary token in the Ring Developer Portal, place it in the ignored `.env`, and restart the server before invoking Ring endpoints. A deployed partner-initiated OAuth flow requires Ring enablement and registered HTTPS redirect URLs; the local prototype does not implement that flow.
 
 ## Hackathon submission checklist
 
