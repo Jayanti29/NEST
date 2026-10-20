@@ -9,5 +9,8 @@ dist/
 *.sqlite-wal
 .DS_Store
 coverage/
+.vercel/
+/public/
 
 *.tsbuildinfo
+.vercel

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "express",
+  "buildCommand": "npm run build && npm run vercel:assets",
+  "installCommand": "npm ci",
+  "rewrites": [
+    {
+      "source": "/:path((?!api(?:/|$)).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

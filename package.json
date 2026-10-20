@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "concurrently -k -n api,web -c blue,green \"npm:dev -w server\" \"npm:dev -w client\"",
     "build": "npm run build -w client && npm run build -w server",
+    "vercel:assets": "node scripts/copy-vercel-assets.mjs",
+    "migrate:postgres": "tsx server/src/migrate-sqlite-to-postgres.ts",
     "start": "npm run start -w server"
   },
   "devDependencies": { "concurrently": "^9.1.2", "typescript": "^5.7.3" }

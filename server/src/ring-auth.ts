@@ -31,7 +31,7 @@ export function parseRingEncryptionKey(encoded: string | undefined): Buffer {
   return key;
 }
 
-function encrypt(key: Buffer, purpose: string, plaintext: string): string {
+export function encryptRingValue(key: Buffer, purpose: string, plaintext: string): string {
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   cipher.setAAD(Buffer.from(`nest:ring:${purpose}`));
@@ -39,7 +39,7 @@ function encrypt(key: Buffer, purpose: string, plaintext: string): string {
   return [iv, cipher.getAuthTag(), ciphertext].map(part => part.toString('base64url')).join('.');
 }
 
-function decrypt(key: Buffer, purpose: string, value: string): string {
+export function decryptRingValue(key: Buffer, purpose: string, value: string): string {
   const [ivPart, tagPart, ciphertextPart] = value.split('.');
   if (!ivPart || !tagPart || !ciphertextPart) throw new Error('Stored Ring token data is invalid.');
   const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivPart, 'base64url'));
@@ -112,7 +112,7 @@ export class RingTokenStore {
       VALUES(?,?,?,?,?,'connected',1,NULL,NULL) ON CONFLICT(account_key) DO UPDATE SET
       account_id_enc=excluded.account_id_enc,access_token_enc=excluded.access_token_enc,refresh_token_enc=excluded.refresh_token_enc,
       expires_at=excluded.expires_at,state='connected',version=ring_oauth_tokens.version+1,refresh_owner=NULL,refresh_lease_until=NULL`)
-      .run(accountKey, encrypt(this.key, 'account', accountId), encrypt(this.key, 'access', tokens.accessToken), encrypt(this.key, 'refresh', tokens.refreshToken), tokens.expiresAt);
+      .run(accountKey, encryptRingValue(this.key, 'account', accountId), encryptRingValue(this.key, 'access', tokens.accessToken), encryptRingValue(this.key, 'refresh', tokens.refreshToken), tokens.expiresAt);
   }
 
   saveUnclaimed(accountId: string, tokens: RingTokens): void {
@@ -121,7 +121,7 @@ export class RingTokenStore {
       VALUES(?,?,?,?,?,'connected','unclaimed',1,NULL,NULL) ON CONFLICT(account_key) DO UPDATE SET
       account_id_enc=excluded.account_id_enc,access_token_enc=excluded.access_token_enc,refresh_token_enc=excluded.refresh_token_enc,
       expires_at=excluded.expires_at,state='connected',link_state='unclaimed',version=ring_oauth_tokens.version+1,refresh_owner=NULL,refresh_lease_until=NULL`)
-      .run(accountKey, encrypt(this.key, 'account', accountId), encrypt(this.key, 'access', tokens.accessToken), encrypt(this.key, 'refresh', tokens.refreshToken), tokens.expiresAt);
+      .run(accountKey, encryptRingValue(this.key, 'account', accountId), encryptRingValue(this.key, 'access', tokens.accessToken), encryptRingValue(this.key, 'refresh', tokens.refreshToken), tokens.expiresAt);
   }
 
   unclaimedAccounts(): StoredRingTokens[] {
@@ -160,9 +160,9 @@ export class RingTokenStore {
     const row = this.db.prepare('SELECT * FROM ring_oauth_tokens WHERE account_key=?').get(accountKey) as any;
     if (!row) return null;
     return {
-      accountId: decrypt(this.key, 'account', row.account_id_enc),
-      accessToken: decrypt(this.key, 'access', row.access_token_enc),
-      refreshToken: decrypt(this.key, 'refresh', row.refresh_token_enc),
+      accountId: decryptRingValue(this.key, 'account', row.account_id_enc),
+      accessToken: decryptRingValue(this.key, 'access', row.access_token_enc),
+      refreshToken: decryptRingValue(this.key, 'refresh', row.refresh_token_enc),
       expiresAt: Number(row.expires_at), version: Number(row.version), state: row.state, linkState: row.link_state
     };
   }
@@ -177,7 +177,7 @@ export class RingTokenStore {
   saveRotated(accountId: string, expectedVersion: number, owner: string, tokens: RingTokens): boolean {
     const result = this.db.prepare(`UPDATE ring_oauth_tokens SET access_token_enc=?,refresh_token_enc=?,expires_at=?,state='connected',version=version+1,refresh_owner=NULL,refresh_lease_until=NULL
       WHERE account_key=? AND version=? AND refresh_owner=?`)
-      .run(encrypt(this.key, 'access', tokens.accessToken), encrypt(this.key, 'refresh', tokens.refreshToken), tokens.expiresAt, this.accountKey(accountId), expectedVersion, owner);
+      .run(encryptRingValue(this.key, 'access', tokens.accessToken), encryptRingValue(this.key, 'refresh', tokens.refreshToken), tokens.expiresAt, this.accountKey(accountId), expectedVersion, owner);
     return Number(result.changes) === 1;
   }
 
