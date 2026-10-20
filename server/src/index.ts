@@ -1,3 +1,4 @@
+import dotenv from 'dotenv';
 import express from 'express';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
@@ -5,6 +6,7 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 import { eventType, requestKind, responseKind, channel } from '../../packages/shared/src/index.js';
 
+dotenv.config({ path: resolve(process.cwd(), '../.env') });
 const app = express();
 app.use(express.json({ limit: '32kb' }));
 const db = new DatabaseSync(process.env.NEST_DB_PATH || 'nest.sqlite');
@@ -49,7 +51,62 @@ const safePerson = (req: express.Request, res: express.Response, id: string) => 
 };
 const log = (personId:string, action:string, detail?:string) => db.prepare('INSERT INTO audit VALUES(?,?,?,?,?)').run(randomUUID(),personId,action,detail || null,new Date().toISOString());
 
+const ringApiBase = 'https://api.amazonvision.com/v1';
+const ringToken = () => process.env.RING_ACCESS_TOKEN?.trim();
+async function ringGet(path: string) {
+  const token = ringToken();
+  if (!token) throw Object.assign(new Error('Ring access token is not configured on the server.'), { status: 503 });
+  const response = await fetch(`${ringApiBase}${path}`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(10000)
+  });
+  if (!response.ok) {
+    const status = response.status;
+    const message = status === 401 ? 'The Ring token expired or was rejected. Generate a new temporary token.'
+      : status === 403 ? 'Ring denied this request. Check the app permissions and token scope.'
+      : status === 429 ? 'Ring rate limit reached. Wait before trying again.'
+      : 'Ring could not complete this request.';
+    throw Object.assign(new Error(message), { status: status === 401 ? 401 : status === 403 ? 403 : status === 429 ? 429 : 502 });
+  }
+  return response.json();
+}
+const ringEndpoint = (req: express.Request, res: express.Response, path: string) => {
+  ringGet(path).then(data => ok(res, { source: 'Ring API', data })).catch((error: any) => {
+    const status = Number(error.status) || 502;
+    fail(res, status, status === 401 ? 'RING_TOKEN_EXPIRED' : status === 403 ? 'RING_FORBIDDEN' : status === 429 ? 'RING_RATE_LIMITED' : status === 503 ? 'RING_NOT_CONFIGURED' : 'RING_UNAVAILABLE', error.message || 'Ring is unavailable.');
+  });
+};
+
 app.get('/api/health', (_req,res) => ok(res,{status:'ready',simulator:process.env.NEST_SIMULATOR !== 'off',aiProvider:process.env.NEST_AI_PROVIDER || 'mock'}));
+app.get('/api/ring/health', (_req,res) => {
+  const token=ringToken(); let remainingMinutes:number|null=null;
+  if(token){try{const payload=JSON.parse(Buffer.from(token.split('.')[1]||'','base64url').toString('utf8'));if(typeof payload.exp==='number')remainingMinutes=Math.max(0,Math.ceil((payload.exp*1000-Date.now())/60000));}catch{}}
+  ok(res,{configured:Boolean(token),tokenExpiresInMinutes:remainingMinutes,transport:'server-to-server'});
+});
+app.get('/api/ring/users/me', (req,res) => ringEndpoint(req,res,'/users/me'));
+app.get('/api/ring/devices', (req,res) => ringEndpoint(req,res,'/devices?include=status,capabilities,location,configurations'));
+app.get('/api/ring/devices/:deviceId', (req,res) => {
+  const id=z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/).safeParse(req.params.deviceId);
+  if(!id.success)return fail(res,400,'VALIDATION_FAILED','Invalid Ring device id.');
+  ringEndpoint(req,res,`/devices/${encodeURIComponent(id.data)}`);
+});
+for (const endpoint of ['status','capabilities','location','configurations'] as const) {
+  app.get(`/api/ring/devices/:deviceId/${endpoint}`, (req,res) => {
+    const id=z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/).safeParse(req.params.deviceId);
+    if(!id.success)return fail(res,400,'VALIDATION_FAILED','Invalid Ring device id.');
+    ringEndpoint(req,res,`/devices/${encodeURIComponent(id.data)}/${endpoint}`);
+  });
+}
+app.get('/api/ring/devices/:deviceId/events', (req,res) => {
+  const id=z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/).safeParse(req.params.deviceId);
+  if(!id.success)return fail(res,400,'VALIDATION_FAILED','Invalid Ring device id.');
+  const query=z.object({since:z.string().datetime().optional(),limit:z.coerce.number().int().min(1).max(100).optional()}).safeParse(req.query);
+  if(!query.success)return fail(res,400,'VALIDATION_FAILED','Check the event-history filters.');
+  const params=new URLSearchParams(); if(query.data.since)params.set('since',query.data.since); if(query.data.limit)params.set('limit',String(query.data.limit));
+  const suffix=params.size?`?${params.toString()}`:'';
+  ringEndpoint(req,res,`/history/devices/${encodeURIComponent(id.data)}/events${suffix}`);
+});
 app.get('/api/people', (_req,res) => ok(res,db.prepare('SELECT id, name, primary_mode AS primaryMode, text_scale AS textScale, dementia_mode AS dementiaMode FROM people').all()));
 app.get('/api/people/:id', (req,res) => { const p=safePerson(req,res,req.params.id); if(p) ok(res,p); });
 app.patch('/api/people/:id/preferences', (req,res) => {
@@ -117,4 +174,4 @@ app.get('/api/people/:id/assistant/history', (_req,res) => ok(res,[]));
 app.use('/api',(_req,res) => fail(res,404,'NOT_FOUND','This page could not be found.'));
 app.use(express.static(resolve(process.cwd(),'../client/dist')));
 app.get('*',(_req,res) => res.sendFile(resolve(process.cwd(),'../client/dist/index.html')));
-const port=Number(process.env.PORT||3001); app.listen(port,()=>console.log(`NEST API listening on ${port}`));
+const port=Number(process.env.PORT||3001); app.listen(port,'127.0.0.1',()=>console.log(`NEST API listening on 127.0.0.1:${port}`));

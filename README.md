@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-Open the Vite URL printed by the client (usually `http://localhost:5173`). The Express API runs on port 3001 and persists demo data in `nest.sqlite`. Use `npm run build` to create production bundles; `npm start` starts the API server. Copy `.env.example` to `.env` to configure the server. No cloud credentials are needed for the default demo.
+Open the Vite URL printed by the client (usually `http://localhost:5173`). The Express API runs on port 3001 and persists demo data in `nest.sqlite`. Use `npm run build` to create production bundles; `npm start` starts the API server. Copy `.env.example` to `.env` to configure the server. Set the file permissions to owner-only (`chmod 600 .env`) and never commit it.
 
 ## What is included
 
@@ -23,9 +23,9 @@ Open the Vite URL printed by the client (usually `http://localhost:5173`). The E
 
 ## Hackathon track fit
 
-The project follows the attached NEST Developer Build Specification and uses the Alexa+ simulated-experience path described in the Build, Ship, Shape hackathon resources. This prototype does **not** connect to Ring devices or claim Ring API integration. The attached NEST specification explicitly places live Ring, Fire TV, or real sensor integration out of scope; events use a simulator and are marked simulated. A Ring adapter is a future extension only.
+The project follows the attached NEST Developer Build Specification and uses the Alexa+ simulated-experience path described in the Build, Ship, Shape hackathon resources. The simulator remains available. An optional Ring Playground makes read-only, server-to-server calls to the documented Ring API when `RING_ACCESS_TOKEN` is configured. The bearer token remains in the ignored local `.env` file and is never sent to the browser or written to SQLite. Ring data is fetched only when a user invokes an endpoint; it is not stored in the NEST demo database.
 
-The AWS Builder mini-challenge is optional. A Bedrock Runtime dependency and configuration placeholder are present as an integration path, but the current assistant is the mock provider and does not make Bedrock calls. Do not describe AWS or Ring as an integration in a submission until the corresponding service is implemented, configured, and demonstrated.
+The AWS Builder mini-challenge is optional. No AWS credentials were supplied, and this build does not call Bedrock. Do not describe AWS as an integration in a submission unless Bedrock is configured and demonstrated.
 
 ## Data, safety and privacy
 
@@ -55,6 +55,8 @@ All JSON responses use `{ "ok": true, "data": ... }` or `{ "ok": false, "error":
 | GET | `/api/people/:id/care/summary` | Care Circle needs-review counts |
 | GET | `/api/people/:id/care/timeline` | Merged caregiver timeline |
 | POST | `/api/people/:id/assistant` | Offline tool-based assistant |
+
+The Ring Playground also proxies the documented read endpoints for users, device list/detail, status, capabilities, location, configurations and event history. These requests go from Express to `https://api.amazonvision.com`; the browser never receives `RING_ACCESS_TOKEN`. The temporary token supplied for this task was rejected with HTTP 401. Generate a fresh token in the Ring Developer Portal, update the ignored `.env`, and restart the server before invoking Ring endpoints.
 
 ## Hackathon submission checklist
 
