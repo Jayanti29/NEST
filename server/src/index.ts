@@ -53,14 +53,27 @@ const log = (personId:string, action:string, detail?:string) => db.prepare('INSE
 
 const ringApiBase = 'https://api.amazonvision.com/v1';
 const ringToken = () => process.env.RING_ACCESS_TOKEN?.trim();
+const ringAppCredentialsConfigured = () => Boolean(process.env.RING_CLIENT_ID?.trim() && process.env.RING_CLIENT_SECRET?.trim());
+const ringTokenExpiry = (token: string) => {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1] || '', 'base64url').toString('utf8'));
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : null;
+  } catch { return null; }
+};
 async function ringGet(path: string) {
   const token = ringToken();
   if (!token) throw Object.assign(new Error('Ring access token is not configured on the server.'), { status: 503 });
-  const response = await fetch(`${ringApiBase}${path}`, {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    signal: AbortSignal.timeout(10000)
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${ringApiBase}${path}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(10000)
+    });
+  } catch (error: any) {
+    const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+    throw Object.assign(new Error(timedOut ? 'Ring request timed out. Try again.' : 'Unable to reach the Ring API.'), { status: timedOut ? 504 : 502 });
+  }
   if (!response.ok) {
     const status = response.status;
     const message = status === 401 ? 'The Ring token expired or was rejected. Generate a new temporary token.'
@@ -75,15 +88,18 @@ const ringEndpoint = (req: express.Request, res: express.Response, path: string)
   res.set('Cache-Control','no-store, private');
   ringGet(path).then(data => ok(res, { source: 'Ring API', data })).catch((error: any) => {
     const status = Number(error.status) || 502;
-    fail(res, status, status === 401 ? 'RING_TOKEN_EXPIRED' : status === 403 ? 'RING_FORBIDDEN' : status === 429 ? 'RING_RATE_LIMITED' : status === 503 ? 'RING_NOT_CONFIGURED' : 'RING_UNAVAILABLE', error.message || 'Ring is unavailable.');
+    fail(res, status, status === 401 ? 'RING_TOKEN_EXPIRED' : status === 403 ? 'RING_FORBIDDEN' : status === 429 ? 'RING_RATE_LIMITED' : status === 503 ? 'RING_NOT_CONFIGURED' : status === 504 ? 'RING_TIMEOUT' : 'RING_UNAVAILABLE', error.message || 'Ring is unavailable.');
   });
 };
 
 app.get('/api/health', (_req,res) => ok(res,{status:'ready',simulator:process.env.NEST_SIMULATOR !== 'off',aiProvider:process.env.NEST_AI_PROVIDER || 'mock'}));
 app.get('/api/ring/health', (_req,res) => {
-  const token=ringToken(); let remainingMinutes:number|null=null;
-  if(token){try{const payload=JSON.parse(Buffer.from(token.split('.')[1]||'','base64url').toString('utf8'));if(typeof payload.exp==='number')remainingMinutes=Math.max(0,Math.ceil((payload.exp*1000-Date.now())/60000));}catch{}}
-  ok(res,{configured:Boolean(token),tokenExpiresInMinutes:remainingMinutes,transport:'server-to-server'});
+  res.set('Cache-Control','no-store, private');
+  const token=ringToken(); const expiresAt=token?ringTokenExpiry(token):null;
+  const expired=Boolean(expiresAt && expiresAt<=Date.now());
+  const credentialsConfigured=ringAppCredentialsConfigured();
+  const status=expired?'token_expired':token?'token_unverified':credentialsConfigured?'authorization_required':'credentials_missing';
+  ok(res,{status,credentialsConfigured,accessTokenConfigured:Boolean(token),tokenExpired:expired,tokenExpiresInMinutes:expiresAt?Math.max(0,Math.ceil((expiresAt-Date.now())/60000)):null,transport:'server-to-server'});
 });
 app.get('/api/ring/users/me', (req,res) => ringEndpoint(req,res,'/users/me'));
 app.get('/api/ring/devices', (req,res) => ringEndpoint(req,res,'/devices?include=status,capabilities,location,configurations'));
