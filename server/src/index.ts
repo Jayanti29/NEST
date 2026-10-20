@@ -3,14 +3,24 @@ import express from 'express';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
+import { chmodSync, existsSync } from 'node:fs';
 import { z } from 'zod';
+import { exchangeRingAuthorizationCode, parseRingEncryptionKey, refreshRingTokens, ringAccountNonce, RingOAuthError, RingTokenStore, safeStringEqual, verifyRingWebhookSignature } from './ring-auth.js';
 import { eventType, requestKind, responseKind, channel } from '../../packages/shared/src/index.js';
 
 dotenv.config({ path: resolve(process.cwd(), '../.env') });
+process.umask(0o077);
 const app = express();
-app.use(express.json({ limit: '32kb' }));
-const db = new DatabaseSync(process.env.NEST_DB_PATH || 'nest.sqlite');
+app.use(express.json({ limit: '32kb', verify: (req, _res, body) => { (req as any).rawBody = Buffer.from(body); } }));
+app.use(express.urlencoded({ extended: false, limit: '8kb' }));
+const dbPath = resolve(process.env.NEST_DB_PATH || 'nest.sqlite');
+const db = new DatabaseSync(dbPath);
+for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) if (existsSync(file)) chmodSync(file, 0o600);
 db.exec('PRAGMA journal_mode = WAL');
+db.exec('PRAGMA secure_delete = ON');
+const ringTokenStore = process.env.RING_TOKEN_ENCRYPTION_KEY
+  ? new RingTokenStore(db, parseRingEncryptionKey(process.env.RING_TOKEN_ENCRYPTION_KEY))
+  : null;
 db.exec(`
 CREATE TABLE IF NOT EXISTS people(id TEXT PRIMARY KEY,name TEXT NOT NULL,primary_mode TEXT NOT NULL DEFAULT 'visual',text_scale REAL NOT NULL DEFAULT 1,dementia_mode INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS activities(id TEXT PRIMARY KEY,person_id TEXT NOT NULL,type TEXT NOT NULL,title TEXT NOT NULL,instruction TEXT NOT NULL,time TEXT NOT NULL,allow_postpone INTEGER NOT NULL DEFAULT 1,approved INTEGER NOT NULL DEFAULT 1);
@@ -20,6 +30,7 @@ CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,person_id TEXT NOT NULL,de
 CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,person_id TEXT NOT NULL,kind TEXT NOT NULL,phrase TEXT NOT NULL,at TEXT NOT NULL,undone_at TEXT);
 CREATE TABLE IF NOT EXISTS checkins(id TEXT PRIMARY KEY,person_id TEXT NOT NULL,reason TEXT NOT NULL,origin TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'open',at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,person_id TEXT,action TEXT NOT NULL,detail TEXT,at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ring_webhook_receipts(request_id TEXT PRIMARY KEY,received_at TEXT NOT NULL);
 `);
 const peopleSeed = [
   ['asha','Asha Rao','visual',1,1], ['iyer','Mr. Iyer','speech',1,0], ['meera','Meera','visual',1.25,0], ['kabir','Kabir','picture',1.25,0]
@@ -51,9 +62,95 @@ const safePerson = (req: express.Request, res: express.Response, id: string) => 
 };
 const log = (personId:string, action:string, detail?:string) => db.prepare('INSERT INTO audit VALUES(?,?,?,?,?)').run(randomUUID(),personId,action,detail || null,new Date().toISOString());
 
+const ringAccountIdentifier = () => process.env.RING_PARTNER_ACCOUNT_IDENTIFIER?.trim();
+const ringLinkPassword = () => process.env.RING_LINK_PASSWORD;
+const ringConfigured = () => ringAppCredentialsConfigured() && Boolean(process.env.RING_TOKEN_ENCRYPTION_KEY && process.env.RING_WEBHOOK_HMAC_KEY?.trim());
+const html = (res: express.Response, status: number, message: string) => res.status(status).type('html').send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>NEST Ring account linking</title><main style="font:16px system-ui;max-width:32rem;margin:4rem auto;padding:1rem"><h1>NEST Ring account linking</h1><p>${message}</p></main>`);
+const ringLinkAttempts = new Map<string, { count: number; resetAt: number }>();
+async function ringApiCall(path: string, method: 'GET' | 'POST' | 'PATCH', accessToken: string, body?: unknown) {
+  let response: Response;
+  try {
+    response = await fetch(`${ringApiBase}${path}`, { method, headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(10000) });
+  } catch (error: any) {
+    throw new Error(error?.name === 'TimeoutError' || error?.name === 'AbortError' ? 'Ring request timed out.' : 'Unable to reach the Ring API.');
+  }
+  if (!response.ok) throw new Error(`Ring request failed with HTTP ${response.status}.`);
+  return response.status === 204 ? null : response.json();
+}
+
+// Ring's one-way (Ring-driven) flow sends the authorization code to this server endpoint.
+app.post('/api/ring/oauth/token-exchange', async (req, res) => {
+  res.set('Cache-Control', 'no-store, private');
+  if (!ringConfigured() || !ringTokenStore) return fail(res, 503, 'RING_NOT_CONFIGURED', 'Ring authorization storage is not configured on the server.');
+  const input = z.object({ code: z.string().min(1).max(4096) }).passthrough().safeParse(req.body);
+  if (!input.success) return fail(res, 400, 'INVALID_RING_REQUEST', 'Ring token exchange request is missing an authorization code.');
+  try {
+    const tokens = await exchangeRingAuthorizationCode(input.data.code, process.env.RING_CLIENT_ID!.trim(), process.env.RING_CLIENT_SECRET!.trim());
+    const profile: any = await ringApiCall('/users/me', 'GET', tokens.accessToken);
+    const accountId = profile?.data?.id;
+    if (typeof accountId !== 'string' || !accountId.startsWith('ava1.ring.account.')) return fail(res, 502, 'RING_PROFILE_INVALID', 'Ring returned an invalid account profile.');
+    ringTokenStore.saveUnclaimed(accountId, tokens);
+    return res.status(200).json({ status: 'received' });
+  } catch (error: any) {
+    const status = error instanceof RingOAuthError ? error.status : 502;
+    return fail(res, status, 'RING_TOKEN_EXCHANGE_FAILED', error.message || 'Ring token exchange failed.');
+  }
+});
+
+app.get('/api/ring/link', (req, res) => {
+  res.set('Cache-Control', 'no-store, private');
+  if (!ringConfigured() || !ringTokenStore || !ringLinkPassword() || !ringAccountIdentifier()) return html(res, 503, 'Ring account linking needs server-side credentials, an encryption key, and the configured NEST account identity.');
+  const time = typeof req.query.time === 'string' ? req.query.time : '';
+  const nonce = typeof req.query.nonce === 'string' ? req.query.nonce : '';
+  if (!/^\d{13}$/.test(time) || !/^[A-Za-z0-9_-]{43}$/.test(nonce)) return html(res, 400, 'This Ring link request is incomplete. Start account linking again from Ring.');
+  return res.type('html').send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Link Ring to NEST</title><main style="font:16px system-ui;max-width:32rem;margin:4rem auto;padding:1rem"><h1>Link Ring to NEST</h1><p>Sign in to your NEST account to finish linking. Ring account access remains private to this server.</p><form method="post" action="/api/ring/link"><input type="hidden" name="time" value="${time}"><input type="hidden" name="nonce" value="${nonce}"><label>NEST account identifier<br><input name="account_identifier" autocomplete="username" required></label><p><label>NEST link password<br><input type="password" name="password" autocomplete="current-password" required></label></p><button>Sign in and link</button></form></main>`);
+});
+
+app.post('/api/ring/link', async (req, res) => {
+  res.set('Cache-Control', 'no-store, private');
+  const input = z.object({ time: z.string().regex(/^\d{13}$/), nonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/), account_identifier: z.string().min(3).max(254), password: z.string().min(1).max(256) }).strict().safeParse(req.body);
+  const linkPassword = ringLinkPassword();
+  const expectedIdentifier = ringAccountIdentifier();
+  if (!input.success || !ringTokenStore || !ringConfigured() || !linkPassword || !expectedIdentifier) return html(res, 400, 'Unable to validate this account-link request. Start again from Ring.');
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const attempt = ringLinkAttempts.get(ip);
+  if (attempt && attempt.resetAt > Date.now() && attempt.count >= 8) return html(res, 429, 'Too many sign-in attempts. Wait 10 minutes and try again.');
+  if (!attempt || attempt.resetAt <= Date.now()) ringLinkAttempts.set(ip, { count: 1, resetAt: Date.now() + 600000 }); else attempt.count++;
+  if (!safeStringEqual(input.data.password, linkPassword) || !safeStringEqual(input.data.account_identifier, expectedIdentifier)) return html(res, 401, 'Sign-in failed. Check your account details and try again.');
+  const timestamp = Number(input.data.time);
+  const delta = Date.now() - timestamp;
+  if (delta < 0 || delta > 600000) return html(res, 400, 'This Ring link request expired. Start account linking again.');
+  const match = ringTokenStore.unclaimedAccounts().find(record => safeStringEqual(ringAccountNonce(input.data.time, record.accountId, process.env.RING_WEBHOOK_HMAC_KEY!.trim()), input.data.nonce));
+  if (!match) return html(res, 400, 'This Ring link request could not be verified. Start account linking again.');
+  try {
+    await ringApiCall('/accounts/me/app-integrations', 'POST', match.accessToken, { account_identifier: expectedIdentifier, nonce: input.data.nonce });
+    await ringApiCall('/accounts/me/app-integrations', 'PATCH', match.accessToken, { status: 'completed' });
+    ringTokenStore.markLinked(match.accountId);
+    return html(res, 200, 'Your Ring account is linked. You can return to NEST.');
+  } catch {
+    return html(res, 502, 'Ring could not finish account linking. Try again from Ring; no credentials were shown.');
+  }
+});
+
+app.post('/api/ring/webhook', (req, res) => {
+  res.set('Cache-Control', 'no-store, private');
+  const secret = process.env.RING_WEBHOOK_HMAC_KEY?.trim();
+  const signature = req.get('X-Signature') || '';
+  const rawBody: Buffer | undefined = (req as any).rawBody;
+  if (!secret || !rawBody || !verifyRingWebhookSignature(rawBody, signature, secret)) return fail(res, 401, 'INVALID_WEBHOOK_SIGNATURE', 'Ring webhook signature is invalid.');
+  const payload = z.object({ meta: z.object({ request_id: z.string().min(1).max(128), account_id: z.string().min(1).max(128) }), data: z.object({ type: z.string().min(1).max(100) }) }).passthrough().safeParse(req.body);
+  if (!payload.success) return fail(res, 400, 'INVALID_WEBHOOK', 'Ring webhook payload is invalid.');
+  try {
+    const inserted = db.prepare('INSERT OR IGNORE INTO ring_webhook_receipts VALUES(?,?)').run(payload.data.meta.request_id, new Date().toISOString());
+    if (Number(inserted.changes) && payload.data.data.type === 'app_integration_removed') ringTokenStore?.unlink(payload.data.meta.account_id);
+    return res.status(200).json({ status: Number(inserted.changes) ? 'processed' : 'already_processed' });
+  } catch { return fail(res, 500, 'WEBHOOK_PROCESSING_FAILED', 'Ring webhook could not be processed.'); }
+});
+
 const ringApiBase = 'https://api.amazonvision.com/v1';
 const ringToken = () => process.env.RING_ACCESS_TOKEN?.trim();
 const ringAppCredentialsConfigured = () => Boolean(process.env.RING_CLIENT_ID?.trim() && process.env.RING_CLIENT_SECRET?.trim());
+let ringVerifiedAt: string | null = null;
 const ringTokenExpiry = (token: string) => {
   try {
     const payload = JSON.parse(Buffer.from(token.split('.')[1] || '', 'base64url').toString('utf8'));
@@ -61,27 +158,47 @@ const ringTokenExpiry = (token: string) => {
   } catch { return null; }
 };
 async function ringGet(path: string) {
-  const token = ringToken();
-  if (!token) throw Object.assign(new Error('Ring access token is not configured on the server.'), { status: 503 });
-  let response: Response;
-  try {
-    response = await fetch(`${ringApiBase}${path}`, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-      signal: AbortSignal.timeout(10000)
-    });
-  } catch (error: any) {
-    const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
-    throw Object.assign(new Error(timedOut ? 'Ring request timed out. Try again.' : 'Unable to reach the Ring API.'), { status: timedOut ? 504 : 502 });
+  const linked = ringTokenStore?.getFirst() || null;
+  const token = linked && ringTokenStore
+    ? await ringTokenStore.getFreshAccessToken(linked.accountId, refreshToken => {
+      if (!ringAppCredentialsConfigured()) throw Object.assign(new Error('Ring app credentials are not configured.'), { status: 503 });
+      return refreshRingTokens(refreshToken, process.env.RING_CLIENT_ID!.trim(), process.env.RING_CLIENT_SECRET!.trim());
+    })
+    : ringToken();
+  if (!token) throw Object.assign(new Error('No Ring account is linked. Complete Ring authorization before making API requests.'), { status: 503 });
+  const send = async (accessToken: string) => {
+    try {
+      return await fetch(`${ringApiBase}${path}`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(10000)
+      });
+    } catch (error: any) {
+      const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+      throw Object.assign(new Error(timedOut ? 'Ring request timed out. Try again.' : 'Unable to reach the Ring API.'), { status: timedOut ? 504 : 502 });
+    }
+  };
+  let response = await send(token);
+  if (response.status === 401 && linked && ringTokenStore) {
+    ringTokenStore.expireNow(linked.accountId);
+    try {
+      const refreshed = await ringTokenStore.getFreshAccessToken(linked.accountId, refreshToken => {
+        if (!ringAppCredentialsConfigured()) throw Object.assign(new Error('Ring app credentials are not configured.'), { status: 503 });
+        return refreshRingTokens(refreshToken, process.env.RING_CLIENT_ID!.trim(), process.env.RING_CLIENT_SECRET!.trim());
+      });
+      response = await send(refreshed);
+      if (response.status === 401) ringTokenStore.markReauthorizationRequired(linked.accountId);
+    } catch (error) { throw error; }
   }
   if (!response.ok) {
     const status = response.status;
-    const message = status === 401 ? 'The Ring token expired or was rejected. Generate a new temporary token.'
+    const message = status === 401 ? 'Ring authorization was rejected. Re-link the Ring account.'
       : status === 403 ? 'Ring denied this request. Check the app permissions and token scope.'
       : status === 429 ? 'Ring rate limit reached. Wait before trying again.'
       : 'Ring could not complete this request.';
     throw Object.assign(new Error(message), { status: status === 401 ? 401 : status === 403 ? 403 : status === 429 ? 429 : 502 });
   }
+  ringVerifiedAt = new Date().toISOString();
   return response.json();
 }
 const ringEndpoint = (req: express.Request, res: express.Response, path: string) => {
@@ -95,11 +212,13 @@ const ringEndpoint = (req: express.Request, res: express.Response, path: string)
 app.get('/api/health', (_req,res) => ok(res,{status:'ready',simulator:process.env.NEST_SIMULATOR !== 'off',aiProvider:process.env.NEST_AI_PROVIDER || 'mock'}));
 app.get('/api/ring/health', (_req,res) => {
   res.set('Cache-Control','no-store, private');
-  const token=ringToken(); const expiresAt=token?ringTokenExpiry(token):null;
-  const expired=Boolean(expiresAt && expiresAt<=Date.now());
+  const stored=ringTokenStore?.getStatus();
+  const token=ringToken(); const expiresAt=stored?.expiresAt ?? (token?ringTokenExpiry(token):null);
+  const expired=Boolean(token && !stored?.linked && expiresAt !== null && expiresAt <= Date.now());
   const credentialsConfigured=ringAppCredentialsConfigured();
-  const status=expired?'token_expired':token?'token_unverified':credentialsConfigured?'authorization_required':'credentials_missing';
-  ok(res,{status,credentialsConfigured,accessTokenConfigured:Boolean(token),tokenExpired:expired,tokenExpiresInMinutes:expiresAt?Math.max(0,Math.ceil((expiresAt-Date.now())/60000)):null,transport:'server-to-server'});
+  const tokenAvailable=Boolean(stored?.linked || token);
+  const status=stored?.state==='reauthorization_required'?'reauthorization_required':stored?.state==='refresh_failed'?'token_refresh_failed':expired?'token_expired':ringVerifiedAt?'connected':tokenAvailable?'token_unverified':credentialsConfigured?'authorization_required':'not_configured';
+  ok(res,{status,credentialsConfigured,accountLinkingConfigured:ringConfigured()&&Boolean(ringLinkPassword()&&ringAccountIdentifier()),accessTokenConfigured:tokenAvailable,tokenExpired:expired,tokenExpiresInMinutes:expiresAt?Math.max(0,Math.ceil((expiresAt-Date.now())/60000)):null,verifiedAt:ringVerifiedAt,transport:'server-to-server'});
 });
 app.get('/api/ring/users/me', (req,res) => ringEndpoint(req,res,'/users/me'));
 app.get('/api/ring/devices', (req,res) => ringEndpoint(req,res,'/devices?include=status,capabilities,location,configurations'));
