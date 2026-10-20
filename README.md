@@ -27,6 +27,8 @@ The project follows the attached NEST Developer Build Specification and uses the
 
 Ring app credentials belong in the ignored local `.env`: `RING_CLIENT_ID`, `RING_CLIENT_SECRET`, and `RING_WEBHOOK_HMAC_KEY`. The client ID and secret identify the app during an OAuth token exchange; they do not grant API access by themselves. The Playground currently uses a temporary `RING_ACCESS_TOKEN` for read-only API requests. A refresh token, if issued for your app, can be stored as `RING_REFRESH_TOKEN`; this prototype does not exchange or persist tokens automatically. Keep `.env` owner-only (`chmod 600 .env`) and never share or commit it. Do not paste tokens or secrets into issues, source files, or chat.
 
+The VS Code workspace includes the Ring Appstore Knowledge MCP server in `.vscode/settings.json` for GitHub Copilot Chat. It searches and retrieves Ring developer documentation; it does not access Ring accounts, devices, or tokens. The same server can be configured in other supported coding assistants by following [Ring's setup guide](https://developer.amazon.com/docs/ring/ring-mcp.html).
+
 The AWS Builder mini-challenge is optional. No AWS credentials were supplied, and this build does not call Bedrock. Do not describe AWS as an integration in a submission unless Bedrock is configured and demonstrated.
 
 ## Data, safety and privacy

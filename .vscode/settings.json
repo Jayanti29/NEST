@@ -1,0 +1,8 @@
+{
+  "github.copilot.chat.mcp.servers": {
+    "ring-appstore-knowledge-mcp-server": {
+      "type": "streamable-http",
+      "url": "https://knowledge.appstore-mcp.ring.amazon.dev/mcp"
+    }
+  }
+}
