@@ -13,6 +13,41 @@ process.umask(0o077);
 const app = express();
 app.use(express.json({ limit: '32kb', verify: (req, _res, body) => { (req as any).rawBody = Buffer.from(body); } }));
 app.use(express.urlencoded({ extended: false, limit: '8kb' }));
+// Optional staging access gate for the UI and application APIs. Ring's public
+// callbacks remain reachable; the link form and signed webhook have their own
+// validation, and token exchange accepts Ring's one-time authorization code.
+const stagingAuthUser = process.env.NEST_STAGING_AUTH_USERNAME;
+const stagingAuthPassword = process.env.NEST_STAGING_AUTH_PASSWORD;
+app.use((req, res, next) => {
+  if (!stagingAuthUser && !stagingAuthPassword) return next();
+  if (!stagingAuthUser || !stagingAuthPassword) {
+    return fail(res, 503, 'STAGING_AUTH_MISCONFIGURED', 'Staging access is not configured correctly.');
+  }
+  const publicRingCallbacks = req.path === '/api/ring/link'
+    || req.path === '/api/ring/oauth/token-exchange'
+    || req.path === '/api/ring/webhook';
+  if (req.path === '/api/health' || publicRingCallbacks) return next();
+  const authorization = req.get('Authorization') || '';
+  const encoded = authorization.match(/^Basic ([A-Za-z0-9+/]+={0,2})$/)?.[1];
+  let username = '';
+  let password = '';
+  if (encoded) {
+    try {
+      const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+      const separator = decoded.indexOf(':');
+      if (separator >= 0) {
+        username = decoded.slice(0, separator);
+        password = decoded.slice(separator + 1);
+      }
+    } catch { /* Treat malformed credentials as an authentication failure. */ }
+  }
+  if (!safeStringEqual(username, stagingAuthUser) || !safeStringEqual(password, stagingAuthPassword)) {
+    res.set('WWW-Authenticate', 'Basic realm="NEST staging", charset="UTF-8"');
+    res.set('Cache-Control', 'no-store, private');
+    return fail(res, 401, 'STAGING_AUTH_REQUIRED', 'Sign in to the NEST staging app.');
+  }
+  return next();
+});
 const dbPath = resolve(process.env.NEST_DB_PATH || 'nest.sqlite');
 const db = new DatabaseSync(dbPath);
 for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) if (existsSync(file)) chmodSync(file, 0o600);
@@ -209,16 +244,30 @@ const ringEndpoint = (req: express.Request, res: express.Response, path: string)
   });
 };
 
-app.get('/api/health', (_req,res) => ok(res,{status:'ready',simulator:process.env.NEST_SIMULATOR !== 'off',aiProvider:process.env.NEST_AI_PROVIDER || 'mock'}));
+app.get('/api/health', (_req,res) => {
+  try {
+    db.prepare('SELECT 1 AS ok').get();
+    return ok(res,{status:'ready',simulator:process.env.NEST_SIMULATOR !== 'off',aiProvider:process.env.NEST_AI_PROVIDER || 'mock'});
+  } catch {
+    return fail(res,503,'NOT_READY','The application database is not ready.');
+  }
+});
 app.get('/api/ring/health', (_req,res) => {
   res.set('Cache-Control','no-store, private');
   const stored=ringTokenStore?.getStatus();
   const token=ringToken(); const expiresAt=stored?.expiresAt ?? (token?ringTokenExpiry(token):null);
   const expired=Boolean(token && !stored?.linked && expiresAt !== null && expiresAt <= Date.now());
-  const credentialsConfigured=ringAppCredentialsConfigured();
+  const clientIdConfigured=Boolean(process.env.RING_CLIENT_ID?.trim());
+  const clientSecretConfigured=Boolean(process.env.RING_CLIENT_SECRET?.trim());
+  const credentialsConfigured=clientIdConfigured&&clientSecretConfigured;
+  const encryptionKeyConfigured=Boolean(ringTokenStore);
+  const webhookKeyConfigured=Boolean(process.env.RING_WEBHOOK_HMAC_KEY?.trim());
+  const accountIdentifierConfigured=Boolean(ringAccountIdentifier());
+  const linkPasswordConfigured=Boolean(ringLinkPassword());
   const tokenAvailable=Boolean(stored?.linked || token);
-  const status=stored?.state==='reauthorization_required'?'reauthorization_required':stored?.state==='refresh_failed'?'token_refresh_failed':expired?'token_expired':ringVerifiedAt?'connected':tokenAvailable?'token_unverified':credentialsConfigured?'authorization_required':'not_configured';
-  ok(res,{status,credentialsConfigured,accountLinkingConfigured:ringConfigured()&&Boolean(ringLinkPassword()&&ringAccountIdentifier()),accessTokenConfigured:tokenAvailable,tokenExpired:expired,tokenExpiresInMinutes:expiresAt?Math.max(0,Math.ceil((expiresAt-Date.now())/60000)):null,verifiedAt:ringVerifiedAt,transport:'server-to-server'});
+  const linkConfigurationReady=ringConfigured()&&linkPasswordConfigured&&accountIdentifierConfigured;
+  const status=stored?.state==='reauthorization_required'?'reauthorization_required':stored?.state==='refresh_failed'?'token_refresh_failed':expired?'token_expired':ringVerifiedAt?'connected':tokenAvailable?'token_unverified':linkConfigurationReady?'authorization_required':'not_configured';
+  ok(res,{status,clientIdConfigured,clientSecretConfigured,credentialsConfigured,encryptionKeyConfigured,webhookKeyConfigured,accountIdentifierConfigured,linkPasswordConfigured,accountLinkingConfigured:ringConfigured()&&linkPasswordConfigured&&accountIdentifierConfigured,accessTokenConfigured:tokenAvailable,tokenExpired:expired,tokenExpiresInMinutes:expiresAt?Math.max(0,Math.ceil((expiresAt-Date.now())/60000)):null,verifiedAt:ringVerifiedAt,transport:'server-to-server'});
 });
 app.get('/api/ring/users/me', (req,res) => ringEndpoint(req,res,'/users/me'));
 app.get('/api/ring/devices', (req,res) => ringEndpoint(req,res,'/devices?include=status,capabilities,location,configurations'));
@@ -310,4 +359,6 @@ app.get('/api/people/:id/assistant/history', (_req,res) => ok(res,[]));
 app.use('/api',(_req,res) => fail(res,404,'NOT_FOUND','This page could not be found.'));
 app.use(express.static(resolve(process.cwd(),'../client/dist')));
 app.get('*',(_req,res) => res.sendFile(resolve(process.cwd(),'../client/dist/index.html')));
-const port=Number(process.env.PORT||3001); app.listen(port,'127.0.0.1',()=>console.log(`NEST API listening on 127.0.0.1:${port}`));
+const port=Number(process.env.PORT||3001);
+const host=process.env.HOST||(process.env.NODE_ENV==='production'?'0.0.0.0':'127.0.0.1');
+app.listen(port,host,()=>console.log(`NEST API listening on ${host}:${port}`));
