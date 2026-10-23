@@ -2,6 +2,11 @@
 
 NEST is a simulated adaptive living companion for older adults and people with disabilities. It brings daily routines, alternative communication, simulated home events and caregiver review into one accessible web app. The demo uses fictional profiles and labels simulated data wherever it appears.
 
+## Live Web App
+
+- **Verified Deployment:** [https://nest-4ofkkb37m-jayanti29s-projects.vercel.app](https://nest-4ofkkb37m-jayanti29s-projects.vercel.app)
+- **Production URL:** [https://nest-six-delta.vercel.app](https://nest-six-delta.vercel.app)
+
 ## Run locally
 
 Requirements: Node.js 22.13+ (the project uses the built-in `node:sqlite` module) and npm.
