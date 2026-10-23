@@ -20,6 +20,11 @@ test('versioned storage migration and durable token-store operations use paramet
   try {
     await migrateStorage(db);
     await migrateStorage(db);
+    const firstReceipt = await db.prepare('INSERT INTO ring_webhook_receipts VALUES(?,?) ON CONFLICT(request_id) DO NOTHING').run('ring-event-test', new Date().toISOString());
+    const replayReceipt = await db.prepare('INSERT INTO ring_webhook_receipts VALUES(?,?) ON CONFLICT(request_id) DO NOTHING').run('ring-event-test', new Date().toISOString());
+    assert.equal(firstReceipt.changes, 1);
+    assert.equal(replayReceipt.changes, 0);
+    assert.equal((await db.prepare('SELECT count(*) AS n FROM ring_webhook_receipts WHERE request_id=?').get('ring-event-test') as any).n, 1);
     const key = Buffer.alloc(32, 9);
     const store = new PostgresRingTokenStore(db, key);
     await store.save('ava1.ring.account.storage-test', { accessToken: 'private-access', refreshToken: 'private-refresh', expiresAt: Date.now() + 3600000 });

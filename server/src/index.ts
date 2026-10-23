@@ -9,6 +9,8 @@ import { PostgresRingTokenStore } from './ring-token-store-postgres.js';
 import { openStorage } from './storage.js';
 import { migrateStorage } from './migrations.js';
 import { eventType, requestKind, responseKind, channel } from '../../packages/shared/src/index.js';
+import { isIsoUtcInstant, unansweredActivities } from './activity-review.js';
+import { validateRingLinkRequest } from './ring-link.js';
 
 if (!process.env.VERCEL) dotenv.config({ path: resolve(process.cwd(), '../.env') });
 process.umask(0o077);
@@ -125,7 +127,8 @@ app.get('/api/ring/link', (req, res) => {
   if (!ringConfigured() || !ringTokenStore || !ringLinkPassword() || !ringAccountIdentifier()) return html(res, 503, 'Ring account linking needs server-side credentials, an encryption key, and the configured NEST account identity.');
   const time = typeof req.query.time === 'string' ? req.query.time : '';
   const nonce = typeof req.query.nonce === 'string' ? req.query.nonce : '';
-  if (!/^\d{13}$/.test(time) || !/^[A-Za-z0-9_-]{43}$/.test(nonce)) return html(res, 400, 'This Ring link request is incomplete. Start account linking again from Ring.');
+  const linkRequestStatus=validateRingLinkRequest(time,nonce);
+  if (linkRequestStatus!=='valid') return html(res, 400, linkRequestStatus==='expired'?'This Ring link request expired. Start account linking again from Ring.':'This Ring link request is incomplete. Start account linking again from Ring.');
   return res.type('html').send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Link Ring to NEST</title><main style="font:16px system-ui;max-width:32rem;margin:4rem auto;padding:1rem"><h1>Link Ring to NEST</h1><p>Sign in to your NEST account to finish linking. Ring account access remains private to this server.</p><form method="post" action="/api/ring/link"><input type="hidden" name="time" value="${time}"><input type="hidden" name="nonce" value="${nonce}"><label>NEST account identifier<br><input name="account_identifier" autocomplete="username" required></label><p><label>NEST link password<br><input type="password" name="password" autocomplete="current-password" required></label></p><button>Sign in and link</button></form></main>`);
 });
 
@@ -135,14 +138,12 @@ app.post('/api/ring/link', async (req, res) => {
   const linkPassword = ringLinkPassword();
   const expectedIdentifier = ringAccountIdentifier();
   if (!input.success || !ringTokenStore || !ringConfigured() || !linkPassword || !expectedIdentifier) return html(res, 400, 'Unable to validate this account-link request. Start again from Ring.');
+  if(validateRingLinkRequest(input.data.time,input.data.nonce)!=='valid')return html(res,400,'This Ring link request expired or is invalid. Start again from Ring.');
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
   const attempt = ringLinkAttempts.get(ip);
   if (attempt && attempt.resetAt > Date.now() && attempt.count >= 8) return html(res, 429, 'Too many sign-in attempts. Wait 10 minutes and try again.');
   if (!attempt || attempt.resetAt <= Date.now()) ringLinkAttempts.set(ip, { count: 1, resetAt: Date.now() + 600000 }); else attempt.count++;
   if (!safeStringEqual(input.data.password, linkPassword) || !safeStringEqual(input.data.account_identifier, expectedIdentifier)) return html(res, 401, 'Sign-in failed. Check your account details and try again.');
-  const timestamp = Number(input.data.time);
-  const delta = Date.now() - timestamp;
-  if (delta < 0 || delta > 600000) return html(res, 400, 'This Ring link request expired. Start account linking again.');
   const unclaimed = await ringTokenStore.unclaimedAccounts();
   const match = unclaimed.find(record => safeStringEqual(ringAccountNonce(input.data.time, record.accountId, process.env.RING_WEBHOOK_HMAC_KEY!.trim()), input.data.nonce));
   if (!match) return html(res, 400, 'This Ring link request could not be verified. Start account linking again.');
@@ -330,7 +331,18 @@ app.post('/api/requests/:id/undo', async (req,res) => { const row=await db.prepa
 app.post('/api/people/:id/checkins', async (req,res) => { const p=await safePerson(req,res,req.params.id); if(!p)return; const v=z.object({reason:z.string().min(1).max(300)}).strict().safeParse(req.body); if(!v.success)return fail(res,400,'VALIDATION_FAILED','Add a short reason.'); const c={id:randomUUID(),person_id:p.id,reason:v.data.reason,origin:'person',state:'open',at:new Date().toISOString()}; await db.prepare('INSERT INTO checkins VALUES(?,?,?,?,?,?,?)').run(c.id,c.person_id,c.reason,c.origin,c.state,c.at); await log(p.id,'checkin_requested',c.reason); ok(res,c); });
 app.get('/api/people/:id/checkins', async (req,res) => { const p=await safePerson(req,res,req.params.id); if(p)ok(res,await db.prepare('SELECT * FROM checkins WHERE person_id=? ORDER BY at DESC').all(p.id)); });
 app.patch('/api/checkins/:id', async (req,res) => { const v=z.object({state:z.enum(['seen','resolved'])}).strict().safeParse(req.body); if(!v.success)return fail(res,400,'VALIDATION_FAILED','Choose seen or resolved.'); const c=await db.prepare('SELECT * FROM checkins WHERE id=?').get(req.params.id) as any; if(!c)return fail(res,404,'NOT_FOUND','Check-in not found.'); await db.prepare('UPDATE checkins SET state=? WHERE id=?').run(v.data.state,c.id); ok(res,{...c,state:v.data.state}); });
-app.get('/api/people/:id/care/summary', async (req,res) => { const p=await safePerson(req,res,req.params.id); if(!p)return; const missed=(await activities(p.id)).filter(a=>a.state==='not_answered'); const checkins=await db.prepare("SELECT * FROM checkins WHERE person_id=? AND state!='resolved' ORDER BY at DESC").all(p.id); ok(res,{needsReview:[...missed,...checkins],counts:{missed:missed.length,checkins:checkins.length}}); });
+app.get('/api/people/:id/care/summary', async (req,res) => {
+  const p=await safePerson(req,res,req.params.id); if(!p)return;
+  const suppliedNow=typeof req.query.localNow==='string'?req.query.localNow:undefined;
+  const suppliedZone=typeof req.query.timeZone==='string'?req.query.timeZone:undefined;
+  if(Boolean(suppliedNow)!==Boolean(suppliedZone)||suppliedNow&&!isIsoUtcInstant(suppliedNow))return fail(res,400,'VALIDATION_FAILED','Provide both localNow as a valid ISO UTC timestamp and timeZone as an IANA timezone.');
+  const localNow=suppliedNow||new Date().toISOString();
+  const timeZone=suppliedZone||'UTC';
+  try { new Intl.DateTimeFormat('en-US',{timeZone}).format(); } catch { return fail(res,400,'VALIDATION_FAILED','Provide a valid IANA timeZone.'); }
+  const unanswered=unansweredActivities(await activities(p.id),localNow,timeZone);
+  const checkins=await db.prepare("SELECT * FROM checkins WHERE person_id=? AND state!='resolved' ORDER BY at DESC").all(p.id);
+  ok(res,{needsReview:[...unanswered,...checkins],counts:{unanswered:unanswered.length,checkins:checkins.length}});
+});
 app.get('/api/people/:id/care/timeline', async (req,res) => { const p=await safePerson(req,res,req.params.id); if(!p)return; const ev=await db.prepare('SELECT id,at,type,provenance,detail FROM events WHERE person_id=? ORDER BY at DESC').all(p.id) as any[]; const rs=await db.prepare('SELECT r.id,r.at,r.kind,a.title FROM responses r JOIN activities a ON a.id=r.activity_id WHERE a.person_id=? ORDER BY r.at DESC').all(p.id) as any[]; const requests=await db.prepare('SELECT id,at,phrase,kind FROM requests WHERE person_id=? AND undone_at IS NULL ORDER BY at DESC').all(p.id) as any[]; ok(res,[...ev.map(e=>({...e,kind:'event',title:e.type.replaceAll('_',' '),status:e.provenance})),...rs.map(r=>({...r,kind:'reminder',status:r.kind==='acknowledged'?'acknowledged':'not acknowledged'})),...requests.map(r=>({...r,kind:'request',title:r.phrase,status:'open'}))].sort((a:any,b:any)=>b.at.localeCompare(a.at))); });
 
 // The mock provider is deterministic and offline-capable. Bedrock is enabled server-side by configuration.
@@ -346,6 +358,7 @@ app.post('/api/people/:id/assistant', async (req,res) => {
 });
 app.get('/api/people/:id/assistant/history', (_req,res) => ok(res,[]));
 app.use('/api',(_req,res) => fail(res,404,'NOT_FOUND','This page could not be found.'));
+if (process.env.VERCEL) app.get('/', (_req, res) => res.redirect(302, '/index.html'));
 app.use((error: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (res.headersSent) return next(error);
   res.set('Cache-Control', 'no-store, private');

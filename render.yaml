@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: nest-ring-staging
+    runtime: node
+    plan: 0.5c-512mb
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    autoDeployTrigger: 'off'
+    healthCheckPath: /api/health
+    numInstances: 1
+    disk:
+      name: nest-staging-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: 24.21.0
+      - key: NODE_ENV
+        value: production
+      - key: NEST_DB_PATH
+        value: /var/data/nest.sqlite
+      - key: NEST_SIMULATOR
+        value: "on"
+      - key: NEST_AI_PROVIDER
+        value: mock
+      - key: NEST_STAGING_AUTH_USERNAME
+        sync: false
+      - key: NEST_STAGING_AUTH_PASSWORD
+        sync: false
+      - key: RING_CLIENT_ID
+        sync: false
+      - key: RING_CLIENT_SECRET
+        sync: false
+      - key: RING_WEBHOOK_HMAC_KEY
+        sync: false
+      - key: RING_TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: RING_PARTNER_ACCOUNT_IDENTIFIER
+        sync: false
+      - key: RING_LINK_PASSWORD
+        sync: false
